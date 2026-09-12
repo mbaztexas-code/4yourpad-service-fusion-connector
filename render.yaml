@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: service-fusion-connector
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: SERVICE_FUSION_CLIENT_ID
+        sync: false
+      - key: SERVICE_FUSION_CLIENT_SECRET
+        sync: false
+      - key: CONNECTOR_API_KEY
+        sync: false
+      - key: SERVICE_FUSION_BASE
+        value: https://api.servicefusion.com/v1
+      - key: SERVICE_FUSION_TOKEN_URL
+        value: https://api.servicefusion.com/oauth/access_token
