@@ -8,7 +8,7 @@ import psycopg
 from fastapi import FastAPI, Header, HTTPException, Query
 from psycopg.types.json import Jsonb
 
-app = FastAPI(title="4 Your Pad Service Fusion Connector", version="1.3.0")
+app = FastAPI(title="4 Your Pad Service Fusion Connector", version="1.4.0")
 
 SF_CLIENT_ID = os.getenv("SERVICE_FUSION_CLIENT_ID", "")
 SF_CLIENT_SECRET = os.getenv("SERVICE_FUSION_CLIENT_SECRET", "")
@@ -322,7 +322,44 @@ async def run_import(resource: str, reset: bool=False, per_page: int=50):
         while True:
             params={"page":page,"per-page":per_page}
             if cfg["sort"]: params["sort"]=cfg["sort"]
-            payload=await sf_get(cfg["path"],params)
+            # Service Fusion occasionally returns temporary 500/502/503/504 errors.
+            # Retry the SAME page with increasing delays instead of stopping the import.
+            retry_delays = [5, 10, 20, 30, 45, 60, 60, 60]
+            payload = None
+            last_error = None
+            for attempt in range(len(retry_delays) + 1):
+                try:
+                    payload = await sf_get(cfg["path"], params)
+                    break
+                except HTTPException as e:
+                    last_error = e
+                    retryable = e.status_code in (429, 502, 503, 504)
+                    if not retryable or attempt >= len(retry_delays):
+                        raise
+                    delay = retry_delays[attempt]
+                    update_state(
+                        resource,
+                        status="running",
+                        error=None,
+                        note=f"Temporary Service Fusion error on page {page}; retry {attempt + 1}/{len(retry_delays)} in {delay}s",
+                    )
+                    await asyncio.sleep(delay)
+                except (httpx.TimeoutException, httpx.RequestError) as e:
+                    last_error = e
+                    if attempt >= len(retry_delays):
+                        raise
+                    delay = retry_delays[attempt]
+                    update_state(
+                        resource,
+                        status="running",
+                        error=None,
+                        note=f"Temporary connection error on page {page}; retry {attempt + 1}/{len(retry_delays)} in {delay}s",
+                    )
+                    await asyncio.sleep(delay)
+
+            if payload is None:
+                raise last_error or RuntimeError(f"Unable to fetch page {page}")
+
             items,total=extract_items(payload)
             if total is not None:
                 try: total=int(total)
@@ -350,7 +387,7 @@ async def run_import(resource: str, reset: bool=False, per_page: int=50):
 
 @app.get("/")
 def root():
-    return {"ok":True,"service":"4 Your Pad Service Fusion Connector","version":"1.3.0",
+    return {"ok":True,"service":"4 Your Pad Service Fusion Connector","version":"1.4.0",
             "database_configured":bool(DATABASE_URL)}
 
 @app.get("/health")
