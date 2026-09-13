@@ -11,7 +11,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from fastapi import FastAPI, HTTPException, Header, Query
 
-app = FastAPI(title="4 Your Pad Company Data Connector", version="1.5.0")
+app = FastAPI(title="4 Your Pad Company Data Connector", version="1.6.0")
 
 SF_BASE = os.getenv("SERVICE_FUSION_BASE", "https://api.servicefusion.com/v1").rstrip("/")
 SF_TOKEN_URL = os.getenv("SERVICE_FUSION_TOKEN_URL", "https://api.servicefusion.com/oauth/access_token")
@@ -19,10 +19,13 @@ SF_CLIENT_ID = os.getenv("SERVICE_FUSION_CLIENT_ID", "")
 SF_CLIENT_SECRET = os.getenv("SERVICE_FUSION_CLIENT_SECRET", "")
 CONNECTOR_API_KEY = os.getenv("CONNECTOR_API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+STRIPE_RESTRICTED_KEY = os.getenv("STRIPE_RESTRICTED_KEY", "")
+STRIPE_BASE = "https://api.stripe.com/v1"
 
 _token: Dict[str, Any] = {}
 _sync_tasks: Dict[str, asyncio.Task] = {}
 _reconcile_tasks: Dict[str, asyncio.Task] = {}
+_stripe_sync_tasks: Dict[str, asyncio.Task] = {}
 
 RESOURCE_CONFIG = {
     "customers": {"path": "/customers", "sort": None, "table": "sf_customers"},
@@ -32,6 +35,15 @@ RESOURCE_CONFIG = {
     "job-statuses": {"path": "/job-statuses", "sort": None, "table": "sf_job_statuses"},
     "sources": {"path": "/sources", "sort": None, "table": "sf_sources"},
     "payment-types": {"path": "/payment-types", "sort": None, "table": "sf_payment_types"},
+}
+
+
+STRIPE_RESOURCE_CONFIG = {
+    "charges": {"path": "/charges", "table": "stripe_charges"},
+    "balance-transactions": {"path": "/balance_transactions", "table": "stripe_balance_transactions"},
+    "payouts": {"path": "/payouts", "table": "stripe_payouts"},
+    "refunds": {"path": "/refunds", "table": "stripe_refunds"},
+    "disputes": {"path": "/disputes", "table": "stripe_disputes"},
 }
 
 
@@ -283,6 +295,121 @@ def init_db():
                 synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS stripe_charges (
+            stripe_id TEXT PRIMARY KEY,
+            amount BIGINT,
+            amount_refunded BIGINT,
+            currency TEXT,
+            created_at_stripe TIMESTAMPTZ,
+            balance_transaction_id TEXT,
+            customer_id TEXT,
+            payment_intent_id TEXT,
+            paid BOOLEAN,
+            captured BOOLEAN,
+            refunded BOOLEAN,
+            status TEXT,
+            description TEXT,
+            raw_json JSONB NOT NULL,
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stripe_charges_created ON stripe_charges(created_at_stripe)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stripe_charges_customer ON stripe_charges(customer_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stripe_charges_payment_intent ON stripe_charges(payment_intent_id)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS stripe_balance_transactions (
+            stripe_id TEXT PRIMARY KEY,
+            amount BIGINT,
+            fee BIGINT,
+            net BIGINT,
+            currency TEXT,
+            created_at_stripe TIMESTAMPTZ,
+            available_on TIMESTAMPTZ,
+            type TEXT,
+            reporting_category TEXT,
+            source_id TEXT,
+            status TEXT,
+            description TEXT,
+            raw_json JSONB NOT NULL,
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stripe_bt_created ON stripe_balance_transactions(created_at_stripe)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stripe_bt_source ON stripe_balance_transactions(source_id)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS stripe_payouts (
+            stripe_id TEXT PRIMARY KEY,
+            amount BIGINT,
+            currency TEXT,
+            created_at_stripe TIMESTAMPTZ,
+            arrival_date TIMESTAMPTZ,
+            status TEXT,
+            type TEXT,
+            method TEXT,
+            automatic BOOLEAN,
+            balance_transaction_id TEXT,
+            description TEXT,
+            statement_descriptor TEXT,
+            failure_code TEXT,
+            failure_message TEXT,
+            raw_json JSONB NOT NULL,
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stripe_payouts_created ON stripe_payouts(created_at_stripe)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stripe_payouts_arrival ON stripe_payouts(arrival_date)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS stripe_refunds (
+            stripe_id TEXT PRIMARY KEY,
+            amount BIGINT,
+            currency TEXT,
+            created_at_stripe TIMESTAMPTZ,
+            charge_id TEXT,
+            payment_intent_id TEXT,
+            balance_transaction_id TEXT,
+            status TEXT,
+            reason TEXT,
+            raw_json JSONB NOT NULL,
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stripe_refunds_created ON stripe_refunds(created_at_stripe)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stripe_refunds_charge ON stripe_refunds(charge_id)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS stripe_disputes (
+            stripe_id TEXT PRIMARY KEY,
+            amount BIGINT,
+            currency TEXT,
+            created_at_stripe TIMESTAMPTZ,
+            charge_id TEXT,
+            payment_intent_id TEXT,
+            reason TEXT,
+            status TEXT,
+            is_charge_refundable BOOLEAN,
+            raw_json JSONB NOT NULL,
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stripe_disputes_created ON stripe_disputes(created_at_stripe)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stripe_disputes_charge ON stripe_disputes(charge_id)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS stripe_sync_state (
+            resource TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'idle',
+            rows_processed INTEGER NOT NULL DEFAULT 0,
+            last_object_id TEXT,
+            last_success_at TIMESTAMPTZ,
+            error TEXT,
+            note TEXT
+        )
+        """)
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS sf_sync_state (
@@ -835,20 +962,365 @@ async def run_jobs_reconcile(per_page: int = 50):
         _reconcile_tasks.pop("jobs", None)
 
 
+
+def stripe_ts(value):
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc)
+    except Exception:
+        return None
+
+
+async def stripe_get(path: str, params: Optional[dict] = None) -> Any:
+    if not STRIPE_RESTRICTED_KEY:
+        raise HTTPException(status_code=500, detail="STRIPE_RESTRICTED_KEY is not configured")
+
+    url = f"{STRIPE_BASE}{path}"
+    retry_delays = [2, 5, 10, 20, 30]
+    last_error = None
+
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.get(
+                    url,
+                    params=params or {},
+                    auth=(STRIPE_RESTRICTED_KEY, "")
+                )
+        except (httpx.TimeoutException, httpx.RequestError) as e:
+            last_error = e
+            if attempt >= len(retry_delays):
+                raise HTTPException(status_code=502, detail=f"Stripe connection error: {e}")
+            await asyncio.sleep(retry_delays[attempt])
+            continue
+
+        if r.status_code < 400:
+            try:
+                return r.json()
+            except Exception:
+                raise HTTPException(status_code=502, detail="Stripe returned invalid JSON")
+
+        last_error = HTTPException(
+            status_code=502,
+            detail=f"Stripe error {r.status_code}: {r.text[:500]}"
+        )
+
+        if r.status_code not in (429, 500, 502, 503, 504) or attempt >= len(retry_delays):
+            raise last_error
+
+        await asyncio.sleep(retry_delays[attempt])
+
+    raise last_error or HTTPException(status_code=502, detail="Stripe request failed")
+
+
+def get_stripe_state(resource: str) -> dict:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM stripe_sync_state WHERE resource=%s", (resource,))
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+        cur.execute(
+            "INSERT INTO stripe_sync_state(resource) VALUES (%s) ON CONFLICT DO NOTHING",
+            (resource,)
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM stripe_sync_state WHERE resource=%s", (resource,))
+        return dict(cur.fetchone())
+
+
+def update_stripe_state(resource: str, **kwargs):
+    current = get_stripe_state(resource)
+    fields = {
+        "status": kwargs.get("status", current.get("status", "idle")),
+        "rows_processed": kwargs.get("rows_processed", current.get("rows_processed", 0)),
+        "last_object_id": kwargs.get("last_object_id", current.get("last_object_id")),
+        "last_success_at": kwargs.get("last_success_at", current.get("last_success_at")),
+        "error": kwargs["error"] if "error" in kwargs else current.get("error"),
+        "note": kwargs["note"] if "note" in kwargs else current.get("note"),
+    }
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO stripe_sync_state
+                (resource,status,rows_processed,last_object_id,last_success_at,error,note)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(resource) DO UPDATE SET
+                status=EXCLUDED.status,
+                rows_processed=EXCLUDED.rows_processed,
+                last_object_id=EXCLUDED.last_object_id,
+                last_success_at=EXCLUDED.last_success_at,
+                error=EXCLUDED.error,
+                note=EXCLUDED.note
+        """, (
+            resource, fields["status"], fields["rows_processed"],
+            fields["last_object_id"], fields["last_success_at"],
+            fields["error"], fields["note"]
+        ))
+        conn.commit()
+
+
+def upsert_stripe_record(resource: str, rec: dict):
+    sid = rec.get("id")
+    if not sid:
+        return False
+
+    with get_conn() as conn, conn.cursor() as cur:
+        if resource == "charges":
+            cur.execute("""
+                INSERT INTO stripe_charges
+                (stripe_id,amount,amount_refunded,currency,created_at_stripe,
+                 balance_transaction_id,customer_id,payment_intent_id,paid,captured,
+                 refunded,status,description,raw_json,synced_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                ON CONFLICT(stripe_id) DO UPDATE SET
+                    amount=EXCLUDED.amount,
+                    amount_refunded=EXCLUDED.amount_refunded,
+                    currency=EXCLUDED.currency,
+                    created_at_stripe=EXCLUDED.created_at_stripe,
+                    balance_transaction_id=EXCLUDED.balance_transaction_id,
+                    customer_id=EXCLUDED.customer_id,
+                    payment_intent_id=EXCLUDED.payment_intent_id,
+                    paid=EXCLUDED.paid,
+                    captured=EXCLUDED.captured,
+                    refunded=EXCLUDED.refunded,
+                    status=EXCLUDED.status,
+                    description=EXCLUDED.description,
+                    raw_json=EXCLUDED.raw_json,
+                    synced_at=NOW()
+            """, (
+                sid, rec.get("amount"), rec.get("amount_refunded"), rec.get("currency"),
+                stripe_ts(rec.get("created")), rec.get("balance_transaction"),
+                rec.get("customer"), rec.get("payment_intent"),
+                rec.get("paid"), rec.get("captured"), rec.get("refunded"),
+                rec.get("status"), rec.get("description"), Jsonb(rec)
+            ))
+
+        elif resource == "balance-transactions":
+            cur.execute("""
+                INSERT INTO stripe_balance_transactions
+                (stripe_id,amount,fee,net,currency,created_at_stripe,available_on,
+                 type,reporting_category,source_id,status,description,raw_json,synced_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                ON CONFLICT(stripe_id) DO UPDATE SET
+                    amount=EXCLUDED.amount,
+                    fee=EXCLUDED.fee,
+                    net=EXCLUDED.net,
+                    currency=EXCLUDED.currency,
+                    created_at_stripe=EXCLUDED.created_at_stripe,
+                    available_on=EXCLUDED.available_on,
+                    type=EXCLUDED.type,
+                    reporting_category=EXCLUDED.reporting_category,
+                    source_id=EXCLUDED.source_id,
+                    status=EXCLUDED.status,
+                    description=EXCLUDED.description,
+                    raw_json=EXCLUDED.raw_json,
+                    synced_at=NOW()
+            """, (
+                sid, rec.get("amount"), rec.get("fee"), rec.get("net"), rec.get("currency"),
+                stripe_ts(rec.get("created")), stripe_ts(rec.get("available_on")),
+                rec.get("type"), rec.get("reporting_category"), rec.get("source"),
+                rec.get("status"), rec.get("description"), Jsonb(rec)
+            ))
+
+        elif resource == "payouts":
+            cur.execute("""
+                INSERT INTO stripe_payouts
+                (stripe_id,amount,currency,created_at_stripe,arrival_date,status,type,method,
+                 automatic,balance_transaction_id,description,statement_descriptor,
+                 failure_code,failure_message,raw_json,synced_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                ON CONFLICT(stripe_id) DO UPDATE SET
+                    amount=EXCLUDED.amount,
+                    currency=EXCLUDED.currency,
+                    created_at_stripe=EXCLUDED.created_at_stripe,
+                    arrival_date=EXCLUDED.arrival_date,
+                    status=EXCLUDED.status,
+                    type=EXCLUDED.type,
+                    method=EXCLUDED.method,
+                    automatic=EXCLUDED.automatic,
+                    balance_transaction_id=EXCLUDED.balance_transaction_id,
+                    description=EXCLUDED.description,
+                    statement_descriptor=EXCLUDED.statement_descriptor,
+                    failure_code=EXCLUDED.failure_code,
+                    failure_message=EXCLUDED.failure_message,
+                    raw_json=EXCLUDED.raw_json,
+                    synced_at=NOW()
+            """, (
+                sid, rec.get("amount"), rec.get("currency"), stripe_ts(rec.get("created")),
+                stripe_ts(rec.get("arrival_date")), rec.get("status"), rec.get("type"),
+                rec.get("method"), rec.get("automatic"), rec.get("balance_transaction"),
+                rec.get("description"), rec.get("statement_descriptor"),
+                rec.get("failure_code"), rec.get("failure_message"), Jsonb(rec)
+            ))
+
+        elif resource == "refunds":
+            cur.execute("""
+                INSERT INTO stripe_refunds
+                (stripe_id,amount,currency,created_at_stripe,charge_id,payment_intent_id,
+                 balance_transaction_id,status,reason,raw_json,synced_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                ON CONFLICT(stripe_id) DO UPDATE SET
+                    amount=EXCLUDED.amount,
+                    currency=EXCLUDED.currency,
+                    created_at_stripe=EXCLUDED.created_at_stripe,
+                    charge_id=EXCLUDED.charge_id,
+                    payment_intent_id=EXCLUDED.payment_intent_id,
+                    balance_transaction_id=EXCLUDED.balance_transaction_id,
+                    status=EXCLUDED.status,
+                    reason=EXCLUDED.reason,
+                    raw_json=EXCLUDED.raw_json,
+                    synced_at=NOW()
+            """, (
+                sid, rec.get("amount"), rec.get("currency"), stripe_ts(rec.get("created")),
+                rec.get("charge"), rec.get("payment_intent"), rec.get("balance_transaction"),
+                rec.get("status"), rec.get("reason"), Jsonb(rec)
+            ))
+
+        elif resource == "disputes":
+            cur.execute("""
+                INSERT INTO stripe_disputes
+                (stripe_id,amount,currency,created_at_stripe,charge_id,payment_intent_id,
+                 reason,status,is_charge_refundable,raw_json,synced_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                ON CONFLICT(stripe_id) DO UPDATE SET
+                    amount=EXCLUDED.amount,
+                    currency=EXCLUDED.currency,
+                    created_at_stripe=EXCLUDED.created_at_stripe,
+                    charge_id=EXCLUDED.charge_id,
+                    payment_intent_id=EXCLUDED.payment_intent_id,
+                    reason=EXCLUDED.reason,
+                    status=EXCLUDED.status,
+                    is_charge_refundable=EXCLUDED.is_charge_refundable,
+                    raw_json=EXCLUDED.raw_json,
+                    synced_at=NOW()
+            """, (
+                sid, rec.get("amount"), rec.get("currency"), stripe_ts(rec.get("created")),
+                rec.get("charge"), rec.get("payment_intent"), rec.get("reason"),
+                rec.get("status"), rec.get("is_charge_refundable"), Jsonb(rec)
+            ))
+        else:
+            return False
+
+        conn.commit()
+    return True
+
+
+async def run_stripe_import(resource: str, reset: bool = False):
+    try:
+        init_db()
+
+        if reset:
+            update_stripe_state(
+                resource,
+                status="idle",
+                rows_processed=0,
+                last_object_id=None,
+                last_success_at=None,
+                error=None,
+                note="Reset for full historical import"
+            )
+
+        state = get_stripe_state(resource)
+        starting_after = None if reset or state.get("status") == "complete" else state.get("last_object_id")
+        processed = 0 if reset or state.get("status") == "complete" else int(state.get("rows_processed") or 0)
+
+        # A completed import starts a fresh full upsert scan unless reset=False and the
+        # caller later moves to an incremental sync version. This is safe but API-heavier.
+        if state.get("status") == "complete" and not reset:
+            starting_after = None
+            processed = 0
+
+        update_stripe_state(
+            resource,
+            status="running",
+            rows_processed=processed,
+            last_object_id=starting_after,
+            error=None,
+            note="Stripe import started"
+        )
+
+        path = STRIPE_RESOURCE_CONFIG[resource]["path"]
+
+        while True:
+            params = {"limit": 100}
+            if starting_after:
+                params["starting_after"] = starting_after
+
+            payload = await stripe_get(path, params)
+            items = payload.get("data", []) if isinstance(payload, dict) else []
+
+            if not items:
+                update_stripe_state(
+                    resource,
+                    status="complete",
+                    rows_processed=processed,
+                    last_object_id=starting_after,
+                    last_success_at=utcnow(),
+                    error=None,
+                    note="Stripe import complete"
+                )
+                break
+
+            for rec in items:
+                if isinstance(rec, dict) and upsert_stripe_record(resource, rec):
+                    processed += 1
+
+            starting_after = items[-1].get("id")
+            update_stripe_state(
+                resource,
+                status="running",
+                rows_processed=processed,
+                last_object_id=starting_after,
+                last_success_at=utcnow(),
+                error=None,
+                note=f"Imported {processed} rows"
+            )
+
+            if not payload.get("has_more"):
+                update_stripe_state(
+                    resource,
+                    status="complete",
+                    rows_processed=processed,
+                    last_object_id=starting_after,
+                    last_success_at=utcnow(),
+                    error=None,
+                    note="Stripe import complete"
+                )
+                break
+
+            await asyncio.sleep(0.15)
+
+    except Exception as e:
+        update_stripe_state(
+            resource,
+            status="error",
+            error=str(e),
+            note="Stripe import stopped with an error"
+        )
+    finally:
+        _stripe_sync_tasks.pop(resource, None)
+
+
+async def run_all_stripe_imports(reset: bool = False):
+    # Sequential by design to keep API and database load gentle.
+    for resource in STRIPE_RESOURCE_CONFIG:
+        await run_stripe_import(resource, reset=reset)
+
+
 @app.get("/")
 async def root():
     return {
         "ok": True,
         "service": "4 Your Pad Service Fusion Connector",
-        "version": "1.5.0",
+        "version": "1.6.0",
         "database_configured": bool(DATABASE_URL),
-        "features": ["service-fusion-sync", "jobs-reconciliation"]
+        "features": ["service-fusion-sync", "jobs-reconciliation", "stripe-sync"]
     }
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "version": "1.5.0"}
+    return {"ok": True, "version": "1.6.0"}
 
 
 @app.get("/test")
@@ -877,6 +1349,11 @@ async def db_status(x_connector_key: Optional[str] = Header(default=None)):
         "job_statuses": count_table("sf_job_statuses"),
         "sources": count_table("sf_sources"),
         "payment_types": count_table("sf_payment_types"),
+        "stripe_charges": count_table("stripe_charges"),
+        "stripe_balance_transactions": count_table("stripe_balance_transactions"),
+        "stripe_payouts": count_table("stripe_payouts"),
+        "stripe_refunds": count_table("stripe_refunds"),
+        "stripe_disputes": count_table("stripe_disputes"),
     }
 
 
@@ -1034,6 +1511,89 @@ async def reconcile_jobs_status(x_connector_key: Optional[str] = Header(default=
     else:
         state["remaining_gap"] = None
     return state
+
+
+
+@app.get("/stripe/test")
+async def stripe_test(x_connector_key: Optional[str] = Header(default=None)):
+    require_key(x_connector_key)
+    data = await stripe_get("/balance")
+    return {
+        "ok": True,
+        "stripe_connected": True,
+        "available": data.get("available", []),
+        "pending": data.get("pending", [])
+    }
+
+
+@app.get("/stripe/db/status")
+async def stripe_db_status(x_connector_key: Optional[str] = Header(default=None)):
+    require_key(x_connector_key)
+    init_db()
+    return {
+        "charges": count_table("stripe_charges"),
+        "balance_transactions": count_table("stripe_balance_transactions"),
+        "payouts": count_table("stripe_payouts"),
+        "refunds": count_table("stripe_refunds"),
+        "disputes": count_table("stripe_disputes"),
+    }
+
+
+@app.get("/stripe/sync/progress")
+async def stripe_sync_progress(x_connector_key: Optional[str] = Header(default=None)):
+    require_key(x_connector_key)
+    init_db()
+    result = {}
+    for resource in STRIPE_RESOURCE_CONFIG:
+        result[resource] = get_stripe_state(resource)
+    return result
+
+
+@app.post("/stripe/sync/start/{resource}")
+async def stripe_sync_start(
+    resource: str,
+    reset: bool = Query(default=False),
+    x_connector_key: Optional[str] = Header(default=None)
+):
+    require_key(x_connector_key)
+    if resource not in STRIPE_RESOURCE_CONFIG:
+        raise HTTPException(status_code=404, detail="Unknown Stripe resource")
+
+    init_db()
+    existing = _stripe_sync_tasks.get(resource)
+    if existing and not existing.done():
+        return {"ok": True, "resource": resource, "message": "Stripe import already running"}
+
+    task = asyncio.create_task(run_stripe_import(resource, reset=reset))
+    _stripe_sync_tasks[resource] = task
+    return {"ok": True, "resource": resource, "message": "Stripe background import started"}
+
+
+@app.post("/stripe/sync/start-all")
+async def stripe_sync_start_all(
+    reset: bool = Query(default=False),
+    x_connector_key: Optional[str] = Header(default=None)
+):
+    require_key(x_connector_key)
+    init_db()
+
+    task_name = "__all__"
+    existing = _stripe_sync_tasks.get(task_name)
+    if existing and not existing.done():
+        return {"ok": True, "message": "Stripe full import already running"}
+
+    task = asyncio.create_task(run_all_stripe_imports(reset=reset))
+    _stripe_sync_tasks[task_name] = task
+
+    def cleanup(_):
+        _stripe_sync_tasks.pop(task_name, None)
+    task.add_done_callback(cleanup)
+
+    return {
+        "ok": True,
+        "message": "Sequential Stripe import started",
+        "resources": list(STRIPE_RESOURCE_CONFIG.keys())
+    }
 
 
 @app.get("/{resource}")
