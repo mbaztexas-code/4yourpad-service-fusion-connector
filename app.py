@@ -1427,6 +1427,7 @@ async def legacy_sync(
     resource: str,
     max_pages: int = Query(default=1, ge=1, le=1000),
     per_page: int = Query(default=50, ge=1, le=50),
+    start_page: int = Query(default=1, ge=1),
     x_connector_key: Optional[str] = Header(default=None)
 ):
     require_key(x_connector_key)
@@ -1438,7 +1439,7 @@ async def legacy_sync(
     rows_processed = 0
     total = None
 
-    for page in range(1, max_pages + 1):
+for page in range(start_page, start_page + max_pages):
         params = {"page": page, "per-page": per_page}
         if cfg.get("sort"):
             params["sort"] = cfg["sort"]
@@ -1458,7 +1459,7 @@ async def legacy_sync(
 
     update_state(
         resource,
-        last_page=pages_synced,
+        last_page=(start_page + pages_synced - 1) if pages_synced else start_page,
         last_success_at=utcnow(),
         total_count=total,
         note=f"Synced {rows_processed} rows in this run"
