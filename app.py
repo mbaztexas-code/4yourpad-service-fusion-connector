@@ -1464,6 +1464,7 @@ for page in range(start_page, start_page + max_pages):
         total_count=total,
         note=f"Synced {rows_processed} rows in this run"
     )
+
     return {
         "ok": True,
         "resource": resource,
