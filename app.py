@@ -1421,7 +1421,6 @@ async def sync_start_all(
             started.append(resource)
     return {"ok": True, "started": started, "warning": "Sequential imports are preferred for large historical loads."}
 
-
 @app.post("/sync/{resource}")
 async def legacy_sync(
     resource: str,
@@ -1431,6 +1430,7 @@ async def legacy_sync(
     x_connector_key: Optional[str] = Header(default=None)
 ):
     require_key(x_connector_key)
+
     if resource not in RESOURCE_CONFIG:
         raise HTTPException(status_code=404, detail="Unknown resource")
 
@@ -1439,30 +1439,43 @@ async def legacy_sync(
     rows_processed = 0
     total = None
 
-for page in range(start_page, start_page + max_pages):
-        params = {"page": page, "per-page": per_page}
+    for page in range(start_page, start_page + max_pages):
+        params = {
+            "page": page,
+            "per-page": per_page,
+        }
+
         if cfg.get("sort"):
             params["sort"] = cfg["sort"]
+
         payload = await sf_get_with_retry(cfg["path"], params)
         items, this_total = extract_items(payload)
+
         if this_total is not None:
             total = this_total
+
         if not items:
             break
+
         rows_processed += upsert_records(resource, items)
         pages_synced += 1
+
         if len(items) < per_page:
             break
+
         if total is not None and page * per_page >= total:
             break
+
         await asyncio.sleep(1.05)
 
     update_state(
         resource,
-        last_page=(start_page + pages_synced - 1) if pages_synced else start_page,
+        last_page=(start_page + pages_synced - 1)
+        if pages_synced
+        else start_page,
         last_success_at=utcnow(),
         total_count=total,
-        note=f"Synced {rows_processed} rows in this run"
+        note=f"Synced {rows_processed} rows in this run",
     )
 
     return {
@@ -1470,7 +1483,7 @@ for page in range(start_page, start_page + max_pages):
         "resource": resource,
         "pages_synced": pages_synced,
         "rows_processed": rows_processed,
-        "service_fusion_total": total
+        "service_fusion_total": total,
     }
 
 
